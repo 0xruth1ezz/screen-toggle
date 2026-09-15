@@ -3,6 +3,7 @@ set -euo pipefail
 
 project_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 app_dir="$project_dir/build/Screen Toggle.app"
+deployment_target="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$project_dir/Info.plist")"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 
 iconset_dir="$project_dir/build/AppIcon.iconset"
@@ -16,7 +17,7 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$iconset_dir" -o "$app_dir/Contents/Resources/AppIcon.icns"
 
-xcrun clang -fobjc-arc -O2 -arch arm64 -mmacosx-version-min=13.0 \
+xcrun clang -fobjc-arc -O2 -arch x86_64 -arch arm64 "-mmacosx-version-min=$deployment_target" \
     -framework AppKit -framework Carbon -framework CoreGraphics \
     "$project_dir/main.m" -o "$app_dir/Contents/MacOS/ScreenToggle"
 cp "$project_dir/Info.plist" "$app_dir/Contents/Info.plist"

@@ -25,13 +25,17 @@ Requires Xcode or Apple Command Line Tools:
 bash build.sh
 ```
 
-The output is an ad-hoc signed Apple Silicon app at `build/Screen Toggle.app`. Copy it to Applications if desired. The app targets macOS 13 and newer, including macOS 27; hardware behavior on macOS 27 has not been tested. Intel is outside this build's scope.
+The output is an ad-hoc signed universal app at `build/Screen Toggle.app`, containing both Intel (`x86_64`, also called `amd64`) and Apple Silicon (`arm64`) executables. Copy it to Applications if desired. The app targets macOS 12 Monterey and newer, matching Lunar 6.11.0's minimum macOS version. Download `ScreenToggle-1.0.1-macos-universal.zip` from the [latest release](https://github.com/0xruth1ezz/screen-toggle/releases/latest) for either architecture.
+
+Hardware display behavior has not been tested on either architecture, including macOS 12 and macOS 27. Display disconnection relies on a private API whose behavior can differ between Intel and Apple Silicon Macs.
+
+The build reads its minimum deployment version from `LSMinimumSystemVersion` in `Info.plist`, keeping the executable and app bundle requirements in sync.
 
 ## Implementation and sources
 
 Display discovery and automatic restoration are based on the approach visible in Lunar's `Lunar/Utils/DisplayController.swift` and `Lunar/Data/Display.swift`. Lunar's actual BlackOut/disconnect implementation is encrypted in this checkout, so this app implements its own display configuration transaction and does not compile Lunar's encrypted sources or licensing code.
 
-The disconnect operation uses the private macOS `SLSConfigureDisplayEnabled` API, with a `CGSConfigureDisplayEnabled` symbol fallback. `SLSGetDisplayList` locates panels omitted by the public online list after disconnecting. These symbols are loaded dynamically: an unavailable API leaves the app launchable with its toggle disabled. Private API behavior may change between macOS versions; no specific macOS 27 hardware compatibility is guaranteed.
+The disconnect operation uses the private macOS `SLSConfigureDisplayEnabled` API, with a `CGSConfigureDisplayEnabled` symbol fallback. `SLSGetDisplayList` locates panels omitted by the public online list after disconnecting. These symbols are loaded dynamically: an unavailable API leaves the app launchable with its toggle disabled. The minimum OS requirement permits launch; display disconnection still depends on the private API working on that hardware and OS version.
 
 - [Lunar](https://github.com/alin23/Lunar): original project; its MIT license is included.
 - [displaytoggle API declarations](https://github.com/calvincchan/displaytoggle/blob/main/Sources/displaytoggle/SkyLightBridge.h): reference for private function signatures. This app contains an independent implementation.
