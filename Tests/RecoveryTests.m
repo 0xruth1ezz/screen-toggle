@@ -8,28 +8,56 @@
 static BOOL builtinOn, externalOn, externalAsleep, externalMirrored, secondExternal;
 static BOOL hideBuiltin, rejectRestore, ignoreRestore;
 static BOOL virtualOn, unknownVirtualIdentity;
+static BOOL virtualBuiltin, missingBuiltinInvalid;
 static NSUInteger restoreRequests, alerts;
 static NSMutableArray *completions;
 
-static boolean_t TestBuiltin(CGDirectDisplayID display) { return display == 1; }
+static BOOL TestMissingBuiltin(CGDirectDisplayID display) {
+    return display == 1 && !builtinOn && missingBuiltinInvalid;
+}
+static boolean_t TestBuiltin(CGDirectDisplayID display) {
+    if (TestMissingBuiltin(display)) return (boolean_t)-1;
+    return display == 1 || (display == 4 && virtualBuiltin);
+}
 static boolean_t TestOnline(CGDirectDisplayID display) {
+    if (TestMissingBuiltin(display)) return (boolean_t)-1;
     return display == 1 ? builtinOn : display == 2 ? externalOn : display == 3 ? secondExternal : virtualOn;
 }
 static uint32_t TestVendor(CGDirectDisplayID display) {
+    if (TestMissingBuiltin(display)) return UINT32_MAX;
     return display == 4 && !unknownVirtualIdentity ? 0x756e6b6e : 0x1234;
 }
 static uint32_t TestModel(CGDirectDisplayID display) {
+    if (TestMissingBuiltin(display)) return UINT32_MAX;
     return display == 4 && !unknownVirtualIdentity ? 0x76697274 : 0x5678;
 }
 static boolean_t TestActive(CGDirectDisplayID display) {
+    if (TestMissingBuiltin(display)) return (boolean_t)-1;
     return TestOnline(display) && !(display == 2 && externalAsleep);
 }
-static boolean_t TestAsleep(CGDirectDisplayID display) { return display == 2 && externalAsleep; }
-static boolean_t TestMirrored(CGDirectDisplayID display) { return display == 2 && externalMirrored; }
+static boolean_t TestAsleep(CGDirectDisplayID display) {
+    if (TestMissingBuiltin(display)) return (boolean_t)-1;
+    return display == 2 && externalAsleep;
+}
+static boolean_t TestMirrored(CGDirectDisplayID display) {
+    if (TestMissingBuiltin(display)) return (boolean_t)-1;
+    return display == 2 && externalMirrored;
+}
 static CGError TestList(uint32_t capacity, CGDirectDisplayID *ids, uint32_t *count) {
     CGDirectDisplayID found[4];
     uint32_t total = 0;
     if (!hideBuiltin) found[total++] = 1;
+    if (externalOn) found[total++] = 2;
+    if (secondExternal) found[total++] = 3;
+    if (virtualOn) found[total++] = 4;
+    *count = total;
+    for (uint32_t i = 0; ids && i < MIN(capacity, total); i++) ids[i] = found[i];
+    return kCGErrorSuccess;
+}
+static CGError TestOnlineList(uint32_t capacity, CGDirectDisplayID *ids, uint32_t *count) {
+    CGDirectDisplayID found[4];
+    uint32_t total = 0;
+    if (builtinOn) found[total++] = 1;
     if (externalOn) found[total++] = 2;
     if (secondExternal) found[total++] = 3;
     if (virtualOn) found[total++] = 4;
@@ -66,7 +94,7 @@ static void TestAfter(dispatch_time_t when, dispatch_queue_t queue, dispatch_blo
 #define CGDisplayIsActive TestActive
 #define CGDisplayIsAsleep TestAsleep
 #define CGDisplayIsInMirrorSet TestMirrored
-#define CGGetOnlineDisplayList TestList
+#define CGGetOnlineDisplayList TestOnlineList
 #define CGBeginDisplayConfiguration TestBegin
 #define CGCompleteDisplayConfiguration TestComplete
 #define CGCancelDisplayConfiguration TestCancel
@@ -90,6 +118,7 @@ static void FinishChanges(void) {
 static TestScreenToggle *NewAppWithSecondScreen(BOOL connected) {
     builtinOn = externalOn = YES;
     externalAsleep = externalMirrored = virtualOn = unknownVirtualIdentity = NO;
+    virtualBuiltin = missingBuiltinInvalid = NO;
     secondExternal = connected;
     hideBuiltin = rejectRestore = ignoreRestore = NO;
     restoreRequests = alerts = 0;
@@ -145,7 +174,7 @@ int main(void) {
         externalOn = NO;
         builtinOn = YES; // macOS itself restores before off verification finishes.
         FinishChanges();
-        assert(builtinOn && restoreRequests == 0);
+        assert(builtinOn && restoreRequests == 1); // Explicitly verify restoration before releasing ownership.
         Stop(app);
 
         app = NewApp();
@@ -248,7 +277,63 @@ int main(void) {
         FinishChanges();
         assert(builtinOn && restoreRequests == 2 && !app.restorePending);
         Stop(app);
-        puts("Passed 13 display recovery scenarios.");
+        app = NewApp();
+        FinishChanges();
+        externalOn = NO;
+        hideBuiltin = virtualOn = virtualBuiltin = YES;
+        [app displaysChanged]; // A fallback claiming to be built-in must not replace the panel.
+        assert(builtinOn && restoreRequests == 1 && app.lastKnownBuiltinDisplay == 1);
+        FinishChanges();
+        Stop(app);
+
+        app = NewApp();
+        FinishChanges();
+        externalOn = NO;
+        hideBuiltin = virtualOn = missingBuiltinInvalid = YES;
+        // Reproduce the -1 status flags captured during the macOS 27 unplug test.
+        assert(![app isEnabled:1]);
+        [app refresh];
+        [app displaysChanged];
+        assert(builtinOn && restoreRequests == 1);
+        FinishChanges();
+        Stop(app);
+
+        app = NewApp();
+        FinishChanges();
+        builtinOn = YES;
+        [app refresh]; // A transient observation during reconfiguration is not verification.
+        builtinOn = externalOn = NO;
+        virtualOn = unknownVirtualIdentity = YES;
+        [app displaysChanged];
+        assert(builtinOn && restoreRequests == 1);
+        FinishChanges();
+        Stop(app);
+        app = NewApp();
+        [app display:2 changedWithFlags:kCGDisplayBeginConfigurationFlag];
+        assert(restoreRequests == 0 && !app.restorePending);
+        [app display:2 changedWithFlags:kCGDisplayRemoveFlag]; // List can still say the monitor is online.
+        assert(app.restorePending && restoreRequests == 0);
+        FinishChanges();
+        assert(builtinOn && restoreRequests == 1);
+        FinishChanges();
+        assert(!app.restorePending && app.managedDisplay == 0);
+        Stop(app);
+
+        app = NewAppWithSecondScreen(YES);
+        FinishChanges();
+        [app display:2 changedWithFlags:kCGDisplayRemoveFlag];
+        assert(!builtinOn && restoreRequests == 0 && !app.restorePending);
+        Stop(app);
+
+        app = NewApp();
+        FinishChanges();
+        builtinOn = YES;
+        [app restore:nil]; // The emergency shortcut sends a request even if status already says on.
+        assert(restoreRequests == 1);
+        FinishChanges();
+        assert(!app.restorePending && app.managedDisplay == 0);
+        Stop(app);
+        puts("Passed 19 display recovery scenarios.");
     }
     return 0;
 }
