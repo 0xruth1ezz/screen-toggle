@@ -2,6 +2,7 @@
 #import <Carbon/Carbon.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <dlfcn.h>
+#import <os/log.h>
 
 // Public display discovery follows Lunar's CGDisplayIsBuiltin approach.
 // Lunar's encrypted BlackOut implementation is not linked into this app.
@@ -16,6 +17,9 @@ typedef CGError (*GetDisplayList)(uint32_t, CGDirectDisplayID *, uint32_t *);
 @property CGDirectDisplayID managedDisplay;
 @property CGDirectDisplayID lastKnownBuiltinDisplay;
 @property BOOL changing;
+@property BOOL sleeping;
+@property BOOL restorePending;
+@property (copy) NSSet<NSNumber *> *externalDisplaysAtDisable;
 @property BOOL toggleShortcutAvailable;
 @property BOOL restoreShortcutAvailable;
 @property ConfigureEnabled configureEnabled;
@@ -23,6 +27,7 @@ typedef CGError (*GetDisplayList)(uint32_t, CGDirectDisplayID *, uint32_t *);
 @property EventHotKeyRef toggleHotKey;
 @property EventHotKeyRef restoreHotKey;
 @property EventHandlerRef hotKeyHandler;
+@property (strong) NSTimer *recoveryTimer;
 - (void)refresh;
 - (void)toggle:(id)sender;
 - (void)restore:(id)sender;
@@ -79,13 +84,45 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
     return self.lastKnownBuiltinDisplay ?: self.managedDisplay;
 }
 
-- (BOOL)hasExternalDisplay {
+- (NSSet<NSNumber *> *)usableExternalDisplays {
+    NSMutableSet *displays = [NSMutableSet set];
     for (NSNumber *number in [self displaysUsing:CGGetOnlineDisplayList]) {
         CGDirectDisplayID display = number.unsignedIntValue;
-        if (!CGDisplayIsBuiltin(display) && CGDisplayIsOnline(display) &&
-            (CGDisplayIsActive(display) || CGDisplayIsInMirrorSet(display))) return YES;
+        // WindowServer's headless fallback in the disconnect log identifies
+        // itself as vendor 'unkn', model 'virt'. It cannot provide a visible screen.
+        if (CGDisplayVendorNumber(display) == 0x756e6b6e &&
+            CGDisplayModelNumber(display) == 0x76697274) continue;
+        if (!CGDisplayIsBuiltin(display) && CGDisplayIsOnline(display) && !CGDisplayIsAsleep(display) &&
+            (CGDisplayIsActive(display) || CGDisplayIsInMirrorSet(display))) [displays addObject:number];
     }
-    return NO;
+    return displays;
+}
+
+- (BOOL)hasExternalDisplay {
+    NSSet *displays = [self usableExternalDisplays];
+    // A newly created virtual screen must not replace the monitor that made
+    // disabling safe. If all original monitors disappear, restore conservatively.
+    return self.externalDisplaysAtDisable ?
+        [displays intersectsSet:self.externalDisplaysAtDisable] : displays.count > 0;
+}
+
+- (void)logDisplayState:(NSString *)reason {
+    NSMutableSet *ids = [NSMutableSet setWithArray:[self displaysUsing:self.getDisplayList] ?: @[]];
+    [ids addObjectsFromArray:[self displaysUsing:CGGetOnlineDisplayList] ?: @[]];
+    CGDirectDisplayID builtin = [self builtinDisplay];
+    if (builtin) [ids addObject:@(builtin)];
+    NSMutableArray *states = [NSMutableArray array];
+    for (NSNumber *number in ids) {
+        CGDirectDisplayID display = number.unsignedIntValue;
+        [states addObject:[NSString stringWithFormat:
+            @"id=%u builtin=%d online=%d active=%d asleep=%d mirror=%d vendor=%x model=%x",
+            display, CGDisplayIsBuiltin(display), CGDisplayIsOnline(display), CGDisplayIsActive(display),
+            CGDisplayIsAsleep(display), CGDisplayIsInMirrorSet(display),
+            CGDisplayVendorNumber(display), CGDisplayModelNumber(display)]];
+    }
+    os_log(OS_LOG_DEFAULT, "Recovery %{public}@: managed=%u changing=%d sleeping=%d pending=%d originalExternal=%{public}@ displays=%{public}@",
+        reason, self.managedDisplay, self.changing, self.sleeping, self.restorePending,
+        self.externalDisplaysAtDisable, states);
 }
 
 - (BOOL)isEnabled:(CGDirectDisplayID)display {
@@ -94,6 +131,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
 }
 
 - (void)applicationDidFinishLaunching:(NSNotification *)notification {
+    os_log(OS_LOG_DEFAULT, "Screen Toggle build %{public}s %{public}s launched from %{public}@",
+        __DATE__, __TIME__, NSBundle.mainBundle.bundlePath);
     // Resolve private symbols at runtime so an OS change produces an error,
     // rather than preventing the app from launching with a missing symbol.
     void *skyLight = dlopen("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight", RTLD_LAZY | RTLD_LOCAL);
@@ -154,7 +193,20 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
         name:NSWorkspaceWillSleepNotification object:nil];
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(didWake:)
         name:NSWorkspaceDidWakeNotification object:nil];
+    [self startRecoveryMonitoring];
+    [self logDisplayState:@"launch"];
     [self displaysChanged];
+}
+
+- (void)startRecoveryMonitoring {
+    // Power changes need not produce a topology callback, and callbacks may
+    // precede the final display state. Keep checking even after a failed restore.
+    [self.recoveryTimer invalidate];
+    __weak ScreenToggle *weakSelf = self;
+    self.recoveryTimer = [NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *timer) {
+        [weakSelf displaysChanged];
+    }];
+    [NSRunLoop.mainRunLoop addTimer:self.recoveryTimer forMode:NSRunLoopCommonModes];
 }
 
 - (void)menuWillOpen:(NSMenu *)menu { [self refresh]; }
@@ -170,7 +222,11 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
     self.toggleItem.toolTip = enabled && ![self hasExternalDisplay] ? @"Connect an external monitor first." : nil;
     self.restoreItem.enabled = self.configureEnabled && display && !self.changing;
     self.statusItem.button.toolTip = self.stateItem.title;
-    if (self.managedDisplay && [self isEnabled:self.managedDisplay] && !self.changing) self.managedDisplay = 0;
+    if (enabled && !self.changing && !self.sleeping) {
+        self.managedDisplay = 0;
+        self.restorePending = NO;
+        self.externalDisplaysAtDisable = nil;
+    }
 }
 
 - (void)showError:(NSString *)message {
@@ -192,9 +248,12 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
         return NO;
     }
     CGDisplayConfigRef configuration = NULL;
+    NSLog(@"Display change begin: id=%u enabled=%d", display, enabled);
     CGError result = CGBeginDisplayConfiguration(&configuration);
+    NSLog(@"Display change begin result: %d", result);
     if (result == kCGErrorSuccess) {
         result = self.configureEnabled(configuration, display, enabled);
+        NSLog(@"Display change configure result: %d", result);
         if (result == kCGErrorSuccess) {
             // macOS restores the session configuration when this process exits.
             result = CGCompleteDisplayConfiguration(configuration, kCGConfigureForAppOnly);
@@ -202,6 +261,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
             CGCancelDisplayConfiguration(configuration);
         }
     }
+    NSLog(@"Display change end: id=%u enabled=%d result=%d", display, enabled, result);
     if (result != kCGErrorSuccess && error) {
         *error = [NSString stringWithFormat:@"macOS rejected the display change (error %d).", result];
     }
@@ -209,12 +269,17 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
 }
 
 - (void)changeEnabled:(BOOL)enabled {
-    if (self.changing) return;
+    if (self.changing || self.sleeping) return;
+    if (!enabled && self.restorePending) { [self displaysChanged]; return; }
     CGDirectDisplayID display = [self builtinDisplay];
     if (!display) { [self showError:@"No built-in display was found."]; return; }
     if ([self isEnabled:display] == enabled) { [self refresh]; return; }
     self.changing = YES;
-    if (!enabled) self.managedDisplay = display;
+    if (!enabled) {
+        self.externalDisplaysAtDisable = [self usableExternalDisplays];
+        self.managedDisplay = display;
+    }
+    [self logDisplayState:enabled ? @"manual on" : @"manual off"];
     [self refresh];
     NSString *error = nil;
     if (![self setDisplay:display enabled:enabled error:&error]) {
@@ -226,6 +291,12 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
     // WindowServer updates its display list after the transaction completes.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         self.changing = NO;
+        if (self.sleeping) return;
+        if (!enabled && (self.restorePending || ![self hasExternalDisplay])) {
+            // Losing the external screen supersedes an in-flight off request.
+            [self displaysChanged];
+            return;
+        }
         if ([self isEnabled:display] != enabled) {
             // A private API can report success without applying the change.
             [self setDisplay:display enabled:YES error:NULL];
@@ -241,20 +312,38 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
 - (void)restore:(id)sender { [self changeEnabled:YES]; }
 
 - (void)displaysChanged {
-    if (self.changing) return;
+    if (self.changing || self.sleeping) return;
     CGDirectDisplayID display = [self builtinDisplay];
-    if (self.configureEnabled && display && ![self isEnabled:display] && ![self hasExternalDisplay]) {
-        [self changeEnabled:YES];
+    if (display && ![self isEnabled:display]) [self logDisplayState:@"check"];
+    if (self.configureEnabled && display && ![self isEnabled:display] &&
+        (self.restorePending || ![self hasExternalDisplay])) {
+        // Automatic recovery must not wait for an alert on an invisible screen.
+        // Hold the change guard while WindowServer settles, then let the timer
+        // retry until discovery confirms the panel is enabled, even if the API
+        // returned success without applying the change.
+        self.changing = YES;
+        self.restorePending = YES;
+        [self setDisplay:display enabled:YES error:NULL];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+            self.changing = NO;
+            [self logDisplayState:@"restore verification"];
+            [self refresh];
+        });
     }
     [self refresh];
 }
 
 - (void)willSleep:(NSNotification *)notification {
-    if (self.managedDisplay) [self setDisplay:self.managedDisplay enabled:YES error:NULL];
+    self.sleeping = YES;
+    if (self.managedDisplay) self.restorePending = YES;
+    [self logDisplayState:@"will sleep"];
+    if (self.restorePending) [self setDisplay:[self builtinDisplay] enabled:YES error:NULL];
 }
 
 - (void)didWake:(NSNotification *)notification {
-    if (self.managedDisplay) [self restore:nil];
+    self.sleeping = NO;
+    if (self.managedDisplay) self.restorePending = YES;
+    [self logDisplayState:@"did wake"];
     [self displaysChanged];
 }
 
@@ -265,6 +354,7 @@ static OSStatus HotKeyPressed(EventHandlerCallRef handler, EventRef event, void 
 }
 
 - (void)applicationWillTerminate:(NSNotification *)notification {
+    [self.recoveryTimer invalidate];
     CGDisplayRemoveReconfigurationCallback(DisplayChanged, (__bridge void *)self);
     [NSWorkspace.sharedWorkspace.notificationCenter removeObserver:self];
     if (self.toggleHotKey) UnregisterEventHotKey(self.toggleHotKey);

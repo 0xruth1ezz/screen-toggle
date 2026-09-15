@@ -11,11 +11,14 @@ Open `build/Screen Toggle.app`. Click the laptop icon in the menu bar, then **Tu
 - **Control–Option–Command–B:** toggle the built-in display.
 - **Control–Option–Command–R:** restore the built-in display.
 - Turning the display off requires an active external monitor.
-- On a display-change event, the app enables an off built-in display whenever no external display is available, even if another app turned it off. It also checks this condition at launch and on wake.
-- The app requests restoration of displays it disabled before sleep and when quitting. macOS also reverts app-scoped display configuration when the process exits.
+- The app checks at launch, on wake, on display changes, and every second. If the built-in display is off and no awake external display is available, it requests restoration, even if another app turned it off. Failed or unapplied automatic restores are retried until the panel is enabled.
+- The app remembers the external monitors present when turning the panel off. Losing all of those monitors triggers restoration, even if macOS creates a new virtual screen. The known WindowServer fallback virtual display is also excluded during launch recovery. Replacing all original monitors therefore turns the built-in panel back on.
+- The app requests restoration of displays it disabled before sleep and when quitting. A pre-sleep restore stays pending across wake until the panel is confirmed enabled, even if an external monitor is connected. macOS also reverts app-scoped display configuration when the process exits.
 - If another app has reserved a shortcut, it will be absent from the menu; the menu actions remain available.
 
 This performs a display disconnect, so macOS can move windows onto the external monitor. It does not place a black window over the built-in screen. macOS manages window placement when reconnecting; exact previous window positions are not saved.
+
+Power-off recovery depends on macOS reporting the external monitor as disconnected, inactive, or asleep. A monitor or dock that continues reporting an awake display after its power button is pressed cannot be detected through these display-state APIs. Use **Control–Option–Command–R** to request restoration in that case.
 
 ## Build
 
@@ -41,4 +44,14 @@ The disconnect operation uses the private macOS `SLSConfigureDisplayEnabled` API
 - [displaytoggle API declarations](https://github.com/calvincchan/displaytoggle/blob/main/Sources/displaytoggle/SkyLightBridge.h): reference for private function signatures. This app contains an independent implementation.
 - [Apple display configuration lifetime](https://developer.apple.com/documentation/coregraphics/cgconfigureoption/forapponly): configuration changes are scoped to the app process, rather than saved permanently.
 
-Compilation produces the app; no automated tests, app launches, or hardware display toggles were performed during creation.
+## Tests
+
+Run `bash test.sh` for deterministic controller tests with simulated display state and configuration calls. They cover unplugging, missing or early callbacks, disconnecting during a toggle, cached panel discovery, failed and unapplied restores, sleeping mirrored monitors, multiple external monitors, fallback virtual displays, and retrying across sleep/wake and reconnection. Tests do not change hardware display settings; physical unplug and power-off behavior still needs verification on a Mac with an external display.
+
+## Diagnostics
+
+The app logs its build and launch path, display identities and state during recovery checks, sleep/wake notifications, and each display configuration stage and result. To inspect a reproduction:
+
+```sh
+/usr/bin/log show --last 15m --style compact --predicate 'process == "ScreenToggle" AND (eventMessage CONTAINS "Recovery" OR eventMessage CONTAINS "Display change" OR eventMessage CONTAINS "Screen Toggle build")'
+```
